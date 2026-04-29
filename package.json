@@ -1,0 +1,40 @@
+{
+  "name": "mcsextractor",
+  "version": "1.0.0",
+  "description": "Minecraft Bedrock Edition Structure Extractor - Extract structures from .mcworld archives",
+  "homepage": "https://github.com/koukiBOBS/mcsextractor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/koukiBOBS/mcsextractor.git"
+  },
+  "author": "koukiBOBS",
+  "license": "MIT",
+  "keywords": [
+    "minecraft",
+    "bedrock",
+    "structure",
+    "extractor",
+    "mcworld",
+    "leveldb",
+    "nbt"
+  ],
+  "type": "module",
+  "scripts": {
+    "serve": "python -m http.server 8000",
+    "test": "node --check app.js && echo '✓ Syntax check passed'"
+  },
+  "devDependencies": {},
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "pako": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "index.html",
+    "app.js",
+    "README.md",
+    "DEPLOYMENT.md"
+  ]
+}
