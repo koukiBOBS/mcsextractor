@@ -234,18 +234,19 @@ class MCStructureExtractor {
     async extractStructures() {
         this.extractedStructures = [];
 
-        // 方法 1: 尝试从 db/ 文件夹中查找结构
-        // LevelDB 数据库通常存储在 db/ 文件夹中
-        const dbFiles = Object.keys(this.zipInstance.files).filter(f => f.startsWith('db/') && !f.endsWith('/'));
+        // 方法 1: 从 LevelDB 数据库中提取结构（优先级最高）
+        const dbFiles = Object.keys(this.zipInstance.files).filter(f =>
+            f.startsWith('db/') && !f.endsWith('/') && (f.endsWith('.ldb') || f.endsWith('.log'))
+        );
 
         if (dbFiles.length > 0) {
-            this.log(`发现 LevelDB 数据库文件 (${dbFiles.length} 个)`, 'info');
+            this.log(`发现 LevelDB 数据库文件 (${dbFiles.length} 个)，开始扫描结构数据...`, 'info');
             await this.extractFromLevelDB(dbFiles);
         }
 
-        // 方法 2: 尝试从根目录查找 .mcstructure 文件
+        // 方法 2: 直接查找 .mcstructure 文件
         const structureFiles = Object.keys(this.zipInstance.files).filter(f =>
-            (f.endsWith('.mcstructure') || f.includes('mystructure')) && !f.endsWith('/')
+            f.endsWith('.mcstructure') && !f.endsWith('/')
         );
 
         if (structureFiles.length > 0) {
@@ -254,89 +255,96 @@ class MCStructureExtractor {
                 try {
                     const data = await this.zipInstance.file(file).async('arraybuffer');
                     const structure = {
-                        name: file,
+                        name: file.split('/').pop(),
                         data: data,
                         size: data.byteLength,
-                        valid: this.validateNBT(new DataView(data)),
-                        source: 'direct'
+                        valid: this.validateStructureNBT(new DataView(data)),
+                        source: 'direct_file'
                     };
                     this.extractedStructures.push(structure);
-                    this.log(`✓ 提取结构: ${file} (${this.formatFileSize(data.byteLength)})`, 'success');
+                    this.log(`✓ 提取结构: ${structure.name} (${this.formatFileSize(data.byteLength)})`, 'success');
                 } catch (error) {
                     this.log(`✗ 无法提取 ${file}: ${error.message}`, 'warning');
                 }
             }
         }
 
-        // 方法 3: 尝试从 level.dat 中提取
-        try {
-            if (this.zipInstance.files['level.dat']) {
-                this.log('检测到 level.dat，尝试解析...', 'info');
-                const levelData = await this.zipInstance.file('level.dat').async('arraybuffer');
-                await this.extractFromLevelDat(levelData);
-            }
-        } catch (error) {
-            this.log(`无法解析 level.dat: ${error.message}`, 'warning');
-        }
-
-        // 方法 4: 扫描所有二进制文件查找结构数据
         if (this.extractedStructures.length === 0) {
-            this.log('没有找到直接的结构文件，进行深扫描...', 'warning');
-            await this.deepScanStructures();
+            this.log('未找到任何结构数据', 'warning');
         }
     }
 
     async extractFromLevelDB(dbFiles) {
         // LevelDB 文件格式解析
-        // 主要尝试读取 LevelDB chunk 数据
+        // 目标: 从 LevelDB blocks 中提取结构块数据
         try {
+            let structureCount = 0;
+
             for (const file of dbFiles) {
-                // 尝试从每个 LevelDB 文件读取数据
-                if (file.match(/\.ldb$/) || file.match(/\.sst$/)) {
-                    try {
-                        const data = await this.zipInstance.file(file).async('arraybuffer');
-                        // 在数据中查找 mystructure 关键字标记
-                        const structures = this.searchStructuresInBinary(data, file);
-                        this.extractedStructures.push(...structures);
-                    } catch (error) {
-                        // 继续处理下一个文件
-                    }
+                try {
+                    if (!file.endsWith('.ldb')) continue;
+
+                    const data = await this.zipInstance.file(file).async('arraybuffer');
+                    const view = new Uint8Array(data);
+
+                    // 在 LevelDB 数据中查找 mystructure: 标记
+                    const structures = this.searchStructureKeysInLevelDB(view, file);
+                    structureCount += structures.length;
+                    this.extractedStructures.push(...structures);
+
+                } catch (error) {
+                    // 继续处理下一个文件
                 }
             }
+
+            if (structureCount > 0) {
+                this.log(`✓ 从 LevelDB 中提取 ${structureCount} 个结构`, 'success');
+            } else {
+                this.log('在 LevelDB 中未找到结构数据，可能此世界中没有保存的结构', 'info');
+            }
         } catch (error) {
-            this.log(`LevelDB 解析错误: ${error.message}`, 'warning');
+            this.log(`LevelDB 扫描出错: ${error.message}`, 'warning');
         }
     }
 
-    searchStructuresInBinary(arrayBuffer, filename) {
+    searchStructureKeysInLevelDB(data, filename) {
         const structures = [];
-        const view = new Uint8Array(arrayBuffer);
         const decoder = new TextDecoder('utf-8', { fatal: false });
 
-        // 查找 mystructure 关键字
-        const keyword = 'mystructure:';
-        const keywordBytes = new TextEncoder().encode(keyword);
+        // 查找关键字: mystructure:, structure, StructureData 等
+        const keywords = ['mystructure:', 'StructureData', 'structure_template'];
 
-        for (let i = 0; i < view.length - keywordBytes.length; i++) {
-            let match = true;
-            for (let j = 0; j < keywordBytes.length; j++) {
-                if (view[i + j] !== keywordBytes[j]) {
-                    match = false;
-                    break;
-                }
-            }
+        for (const keyword of keywords) {
+            const keywordBytes = new TextEncoder().encode(keyword);
 
-            if (match) {
-                // 找到关键字，提取结构名称
-                let nameEnd = i + keywordBytes.length;
-                while (nameEnd < view.length && view[nameEnd] !== 0 && nameEnd - i < 256) {
-                    nameEnd++;
+            for (let i = 0; i < data.length - keywordBytes.length; i++) {
+                let match = true;
+                for (let j = 0; j < keywordBytes.length; j++) {
+                    if (data[i + j] !== keywordBytes[j]) {
+                        match = false;
+                        break;
+                    }
                 }
 
-                const nameBytes = view.slice(i, nameEnd);
-                const name = decoder.decode(nameBytes).split('\0')[0];
+                if (match) {
+                    // 找到关键字，尝试提取结构名称
+                    let nameEnd = i + keywordBytes.length;
 
-                this.log(`🔍 在 ${filename} 中发现: ${name}`, 'info');
+                    // 读取直到遇到空字符或非可打印字符
+                    const nameStart = i;
+                    while (nameEnd < data.length && nameEnd - i < 200) {
+                        const byte = data[nameEnd];
+                        if (byte < 32 || byte > 126) break;
+                        nameEnd++;
+                    }
+
+                    const name = decoder.decode(data.slice(nameStart, nameEnd));
+
+                    // 如果找到有效的结构名称
+                    if (name.length > keyword.length + 2) {
+                        this.log(`🔍 在 ${filename} 中发现结构标记: ${name.substring(0, 50)}`, 'info');
+                    }
+                }
             }
         }
 
@@ -344,98 +352,118 @@ class MCStructureExtractor {
     }
 
     async extractFromLevelDat(data) {
-        // level.dat 是 NBT 格式，可以尝试解析
-        // NBT 格式以标签类型开头 (1 字节) + 名称长度 (2 字节) + 名称 + 数据
+        // level.dat 是 gzip 压缩的 NBT 数据
+        // 首先尝试解压缩
         try {
-            const structures = this.parseNBTForStructures(new DataView(data));
-            this.extractedStructures.push(...structures);
+            // 检查 gzip 魔数 (1f 8b)
+            const view = new Uint8Array(data);
+            if (view[0] === 0x1f && view[1] === 0x8b) {
+                this.log('level.dat 已压缩，尝试解压...', 'info');
+                try {
+                    const decompressed = pako.inflate(data);
+                    this.parseStructureDataFromNBT(new DataView(decompressed));
+                } catch (error) {
+                    this.log(`解压 level.dat 失败: ${error.message}`, 'warning');
+                }
+            } else {
+                // 未压缩的 NBT 数据
+                this.parseStructureDataFromNBT(new DataView(data));
+            }
         } catch (error) {
-            this.log(`level.dat 解析失败: ${error.message}`, 'warning');
+            this.log(`解析 level.dat 异常: ${error.message}`, 'warning');
         }
     }
 
-    parseNBTForStructures(dataView) {
-        const structures = [];
-        // 基础 NBT 解析逻辑
-        // 这是一个简化版本，完整的 NBT 解析需要递归处理
-
+    parseStructureDataFromNBT(dataView) {
+        // 解析 NBT 数据查找结构信息
         try {
-            const bytes = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
-            const decoder = new TextDecoder();
+            const view = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
+            const decoder = new TextDecoder('utf-8', { fatal: false });
 
-            // 在整个数据中搜索 mystructure: 标记
-            let offset = 0;
-            while (offset < bytes.length - 10) {
-                // 查找 mystructure: string markers
-                if (bytes[offset] === 0x08) { // STRING tag
-                    const lengthBE = bytes[offset + 1] << 8 | bytes[offset + 2];
-                    if (lengthBE > 0 && lengthBE < 1000 && offset + 3 + lengthBE < bytes.length) {
-                        const str = decoder.decode(bytes.slice(offset + 3, offset + 3 + lengthBE));
-                        if (str.includes('mystructure:')) {
-                            this.log(`✓ 在 level.dat 中找到: ${str}`, 'success');
-                        }
+            // 查找 "mystructure:" 标记
+            const keyword = 'mystructure:';
+            const keywordBytes = new TextEncoder().encode(keyword);
+
+            for (let i = 0; i < view.length - keywordBytes.length; i++) {
+                let match = true;
+                for (let j = 0; j < keywordBytes.length; j++) {
+                    if (view[i + j] !== keywordBytes[j]) {
+                        match = false;
+                        break;
                     }
                 }
-                offset++;
+
+                if (match) {
+                    // 提取结构名称
+                    let nameEnd = i + keywordBytes.length;
+                    while (nameEnd < view.length && view[nameEnd] > 32 && view[nameEnd] < 127 && nameEnd - i < 200) {
+                        nameEnd++;
+                    }
+
+                    const structureName = decoder.decode(view.slice(i, nameEnd));
+                    if (structureName.length > keyword.length) {
+                        this.log(`✓ 在 level.dat 中发现结构: ${structureName}`, 'success');
+                    }
+                }
             }
         } catch (error) {
             // 忽略解析错误
         }
-
-        return structures;
     }
 
     validateNBT(dataView) {
-        // 基础 NBT 验证
-        // NBT 文件应该以特定的字节开头
-        if (dataView.byteLength < 2) return false;
-
-        const firstByte = dataView.getUint8(0);
-        // 0x0a = TAG_Compound，0x09 = TAG_List 等
-        return firstByte >= 0x01 && firstByte <= 0x0c;
+        // 过于宽松的 NBT 验证，移除此方法
+        // 改用更严格的结构特定验证
+        return false;
     }
 
-    async deepScanStructures() {
-        // 深度扫描所有文件查找结构数据
-        const files = Object.keys(this.zipInstance.files);
-        let scanCount = 0;
+    validateStructureNBT(dataView) {
+        // 严格的 NBT 结构文件验证
+        // .mcstructure 文件应该满足以下条件：
+        if (dataView.byteLength < 100) return false;
 
-        for (const file of files) {
-            // 跳过目录和已知不相关的文件
-            if (file.endsWith('/') || file === 'level.dat' || file.match(/^db\//)) {
-                continue;
+        try {
+            const firstByte = dataView.getUint8(0);
+
+            // .mcstructure 文件通常以 0x0a (TAG_Compound) 开头
+            if (firstByte !== 0x0a) {
+                return false;
             }
 
-            try {
-                const data = await this.zipInstance.file(file).async('arraybuffer');
+            // 读取结构名称长度（跟在 TAG_Compound 后的 Short）
+            const nameLength = dataView.getInt16(1, false);
 
-                // 检查文件大小是否合理(结构通常不会太小或太大)
-                if (data.byteLength < 100 || data.byteLength > 50 * 1024 * 1024) {
-                    continue;
-                }
-
-                // 尝试验证 NBT 格式
-                if (this.validateNBT(new DataView(data))) {
-                    const structure = {
-                        name: file,
-                        data: data,
-                        size: data.byteLength,
-                        valid: true,
-                        source: 'deep_scan'
-                    };
-                    this.extractedStructures.push(structure);
-                    this.log(`✓ 深扫描发现结构: ${file} (${this.formatFileSize(data.byteLength)})`, 'success');
-                    scanCount++;
-                }
-            } catch (error) {
-                // 继续扫描下一个文件
+            // 结构名称长度应该合理（1-100字节）
+            if (nameLength < 1 || nameLength > 100) {
+                return false;
             }
-        }
 
-        if (scanCount > 0) {
-            this.log(`深扫描完成，找到 ${scanCount} 个潜在的结构文件`, 'success');
-        } else {
-            this.log('深扫描未发现任何结构数据', 'warning');
+            // 检查是否有足够的数据
+            if (dataView.byteLength < 3 + nameLength + 10) {
+                return false;
+            }
+
+            // 读取结构名称
+            const nameBytes = new Uint8Array(
+                dataView.buffer,
+                dataView.byteOffset + 3,
+                nameLength
+            );
+            const name = new TextDecoder().decode(nameBytes);
+
+            // 结构名称应该是可打印的 ASCII
+            if (!/^[\x20-\x7E]+$/.test(name)) {
+                return false;
+            }
+
+            // 结构名称不应该包含 JSON 或 XML 标记（用于排除配置文件）
+            if (name.includes('{') || name.includes('[') || name.includes('<')) {
+                return false;
+            }
+
+            return true;
+        } catch (error) {
+            return false;
         }
     }
 
