@@ -20,13 +20,18 @@
   ],
   "type": "module",
   "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
     "serve": "python -m http.server 8000",
     "test": "node --check app.js && echo '✓ Syntax check passed'"
   },
   "devDependencies": {},
   "dependencies": {
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
     "jszip": "^3.10.1",
-    "pako": "^2.1.0"
+    "pako": "^2.1.0",
+    "@mcbe/leveldb": "^1.0.0"
   },
   "engines": {
     "node": ">=14.0.0"
